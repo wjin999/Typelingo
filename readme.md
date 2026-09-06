@@ -26,7 +26,7 @@ v0.3 包含：
 - 使用 localStorage 保存永久跳过的句子
 - 多标签页同步练习记录、永久跳过列表与导入卡组
 - 导出 JSON 进度备份，并在另一台设备 / 浏览器中合并恢复
-- 响应式布局和 GitHub Pages 自动部署配置
+- 响应式布局、Sites 静态托管和 GitHub Actions 自动检查
 
 ## 本地开发
 
@@ -51,6 +51,12 @@ npm run build
 - “本次跳过该句”不会计入完成句数，也不会影响之后的练习。
 - “永远跳过该句”不会计入完成句数，并会从之后的随机练习中排除；可在首页恢复全部。
 - 计时从进入本轮练习开始，到完成或跳过最后一个句子为止。
+
+## 发布
+
+网站通过 Sites 静态托管，配置保存在 `.openai/hosting.json`。GitHub 源码仓库保持私有，推送到 `main` 会自动执行测试与构建。
+
+项目使用相对资源路径，可部署在网站根目录或子目录。GitHub Actions 也保留可选的 GitHub Pages 发布流程；仅在仓库已启用 Pages 后，手动运行工作流并勾选 `deploy_pages`。
 
 ## 添加 Anki 卡组
 
@@ -132,7 +138,7 @@ node scripts/import-default-deck.mjs "path/to/egg-rolls.apkg"
 - localStorage
 - IndexedDB
 - Web Worker、sql.js、fflate、fzstd、htmlparser2
-- GitHub Pages
+- Sites 静态托管 / 可选 GitHub Pages
 
 ## 项目限制
 
