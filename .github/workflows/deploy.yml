@@ -4,11 +4,6 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      deploy_pages:
-        description: 'Publish to GitHub Pages (requires Pages to be enabled)'
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -37,16 +32,13 @@ jobs:
       - name: Build
         run: npm run build
       - name: Configure Pages
-        if: github.event_name == 'workflow_dispatch' && inputs.deploy_pages
         uses: actions/configure-pages@v5
       - name: Upload artifact
-        if: github.event_name == 'workflow_dispatch' && inputs.deploy_pages
         uses: actions/upload-pages-artifact@v4
         with:
           path: dist
 
   deploy:
-    if: github.event_name == 'workflow_dispatch' && inputs.deploy_pages
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
