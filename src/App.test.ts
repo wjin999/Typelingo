@@ -1,117 +1,149 @@
 // @vitest-environment jsdom
-
 import { act, createElement, StrictMode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { IDBFactory } from 'fake-indexeddb'
 import App from './App'
-import lessonData from './data/egg-rolls.json'
-import 'fake-indexeddb/auto'
-import {
-  addHistoryEntry,
-  clearPermanentlySkippedSentences,
-  loadHistory,
-  permanentlySkipSentence,
-} from './lib/storage'
+import { addHistoryEntry, exportProgress, PROGRESS_UPDATED_KEY } from './lib/storage'
+
+vi.mock('./lib/default-deck', () => ({ loadDefaultDeck: async () => ({
+  schemaVersion: 2, id: 'test-deck', title: '测试卡组', nativeLanguage: 'zh-CN', targetLanguage: 'ja',
+  items: Array.from({ length: 12 }, (_, index) => ({ id: `sentence-${index}`, sourceNoteId: `note-${index}`,
+    text: index === 0 ? '猫1234。' : `猫${index}。`, nativeText: '猫', level: 'N5',
+    ruby: [{ text: '猫', reading: 'ねこ' }, { text: index === 0 ? '1234。' : `${index}。` }] })),
+}) }))
 
 let container: HTMLDivElement
 let root: Root
-
-vi.mock('./lib/default-deck', () => ({ loadDefaultDeck: async () => lessonData }))
-
 beforeEach(() => {
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true)
+  vi.stubGlobal('indexedDB', new IDBFactory())
   window.localStorage.clear()
-  container = document.createElement('div')
-  document.body.append(container)
+  container = document.createElement('div'); document.body.append(container)
   root = createRoot(container)
 })
-
-afterEach(() => {
-  act(() => root.unmount())
-  container.remove()
-  vi.unstubAllGlobals()
-})
-
-async function mountApp() {
-  await act(async () => root.render(createElement(StrictMode, null, createElement(App))))
-}
+afterEach(() => { act(() => root.unmount()); container.remove(); vi.unstubAllGlobals() })
 
 function button(label: string): HTMLButtonElement {
-  const match = [...container.querySelectorAll('button')].find((element) =>
-    element.textContent?.includes(label),
-  )
-  if (!match) throw new Error(`Button not found: ${label}`)
-  return match
+  const found = [...container.querySelectorAll('button')].find((element) => element.textContent?.includes(label))
+  if (!found) throw new Error(`Button not found: ${label}`)
+  return found
 }
-
-function clickButton(label: string) {
-  act(() => button(label).click())
+async function until(check: () => boolean) {
+  for (let index = 0; index < 100; index++) {
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 5)) })
+    if (check()) return
+  }
+  throw new Error('UI did not settle')
 }
-
-function storageChanged(key: string | null) {
-  act(() => window.dispatchEvent(new StorageEvent('storage', {
-    key,
-    storageArea: window.localStorage,
-  })))
+async function mount() {
+  await act(async () => root.render(createElement(StrictMode, null, createElement(App))))
+  await until(() => [...container.querySelectorAll('button')].some((element) => element.textContent?.includes('开始练习') && !element.disabled))
 }
-
-describe('practice storage and empty lesson states', () => {
-  it('renders the home screen even when a saved date is invalid', async () => {
-    window.localStorage.setItem('typelingo.history.ja.v2', JSON.stringify([{
-      id: 'invalid-session',
-      completedAt: 'not-a-date',
-      lessonId: 'ja-basic',
-      sentenceCount: 1,
-      elapsedMs: 1000,
-    }]))
-
-    await expect(mountApp()).resolves.not.toThrow()
-    expect(button('开始练习').disabled).toBe(false)
-    expect(container.querySelectorAll('.history-row')).toHaveLength(0)
+async function start() {
+  act(() => button('开始练习').click())
+  await until(() => !!container.querySelector('#typing-input'))
+}
+const input = () => container.querySelector<HTMLInputElement>('#typing-input')!
+function type(value: string) {
+  act(() => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input(), value)
+    input().dispatchEvent(new Event('input', { bubbles: true }))
   })
+}
+function key(key: string, options: KeyboardEventInit = {}) {
+  act(() => input().dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...options })))
+}
 
-  it('updates visible history and skipped counts after another tab changes storage', async () => {
-    await mountApp()
-    addHistoryEntry([], {
-      id: 'another-tab',
-      completedAt: '2026-09-05T00:00:00.000Z',
-      lessonId: 'ja-basic',
-      sentenceCount: 3,
-      elapsedMs: 2000,
-    })
-    storageChanged('typelingo.history.ja.v2')
-    expect(container.querySelector('.history-row')?.textContent).toContain('完成 3 句')
-
-    permanentlySkipSentence([], lessonData.items[0]!.id)
-    storageChanged('typelingo.skipped-sentences.ja.v1')
-    expect(button('已永久跳过 1 句')).toBeDefined()
-
-    clearPermanentlySkippedSentences()
-    storageChanged('typelingo.skipped-sentences.ja.v1')
-    expect(container.textContent).not.toContain('恢复全部')
-
-    window.localStorage.clear()
-    storageChanged(null)
-    expect(container.querySelectorAll('.history-row')).toHaveLength(0)
-  })
-
-  it('disables restart when the final available sentence is skipped and enables it after restore', async () => {
-    window.localStorage.setItem('typelingo.skipped-sentences.ja.v1', JSON.stringify(
-      lessonData.items.slice(1).map((item) => item.id),
-    ))
-    await mountApp()
-    clickButton('开始练习')
-    clickButton('永远跳过该句')
-
-    expect(button('再来一组').disabled).toBe(true)
-    expect(container.textContent).toContain('没有可练习句子，请返回主页恢复已跳过的句子。')
-    expect(loadHistory()).toHaveLength(1)
-    expect(loadHistory()[0]?.sentenceCount).toBe(0)
-
-    clearPermanentlySkippedSentences()
-    storageChanged('typelingo.skipped-sentences.ja.v1')
-    expect(button('再来一组').disabled).toBe(false)
-    clickButton('再来一组')
+describe('keyboard memory reviews', () => {
+  it.each([1, 2, 3, 4])('locks the completed input and records grade %s exactly once', async (grade) => {
+    await mount(); await start()
+    expect(container.querySelector('rt')).toBeNull()
+    key(String(grade))
+    expect(container.querySelector('.rating-panel')).toBeNull()
+    type('猫1234。')
+    expect(input().readOnly).toBe(true)
+    expect(container.querySelectorAll('.rating-button')).toHaveLength(4)
+    expect([...container.querySelectorAll('kbd')].map((element) => element.textContent)).toEqual(['1', '2', '3', '4'])
+    expect(container.querySelector('rt')?.textContent).toBe('ねこ')
+    key('Enter')
     expect(container.querySelector('.progress-count')?.textContent).toBe('1 / 10')
+    key(String(grade), { repeat: true })
+    key(String(grade), { ctrlKey: true })
+    expect((await exportProgress()).reviews).toHaveLength(0)
+    key(String(grade)); key(String(grade))
+    await until(() => container.querySelector('.progress-count')?.textContent === '2 / 10')
+    expect(input().readOnly).toBe(false)
+    expect(input().value).toBe('')
+    expect(document.activeElement).toBe(input())
+    const data = await exportProgress()
+    expect(data.reviews).toHaveLength(1)
+    expect(data.reviews[0]?.rating).toBe(grade)
+    expect(data.cards[0]?.card.reps).toBe(1)
+    expect(data.history[0]?.partial).toBe(true)
+    expect(data.history[0]?.sentenceCount).toBe(1)
+  })
+
+  it('does not lock or rate during IME conversion, including numeric candidate keys', async () => {
+    await mount(); await start()
+    act(() => input().dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true })))
+    type('猫1234。')
+    key('3', { isComposing: true, keyCode: 229 })
+    expect(input().readOnly).toBe(false)
+    expect(container.querySelector('.rating-panel')).toBeNull()
+    act(() => input().dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '猫1234。' })))
+    expect(input().readOnly).toBe(true)
+    key('1', { isComposing: true, keyCode: 229 })
+    expect((await exportProgress()).reviews).toHaveLength(0)
+    key('4')
+    await until(() => container.querySelector('.progress-count')?.textContent === '2 / 10')
+    expect((await exportProgress()).reviews[0]?.rating).toBe(4)
+  })
+
+  it('keeps free typing on Enter with furigana enabled, and leaves memory plans unchanged', async () => {
+    await mount()
+    act(() => button('自由跟打').click())
+    await start()
+    expect(container.querySelector('rt')).not.toBeNull()
+    type(container.querySelector('.sentence')!.getAttribute('aria-label')!)
+    key('3')
+    expect(container.querySelector('.rating-panel')).toBeNull()
+    key('Enter')
+    await until(() => container.querySelector('.progress-count')?.textContent === '2 / 10')
+    const data = await exportProgress()
+    expect(data.cards).toEqual([])
+    expect(data.reviews[0]?.rating).toBeNull()
+  })
+
+  it('finishes a full round once and stops introducing new cards after the daily limit', async () => {
+    await mount(); await start()
+    for (let index = 0; index < 10; index++) {
+      type(container.querySelector('.sentence')!.getAttribute('aria-label')!)
+      key('4')
+      await until(() => index === 9 ? !!container.querySelector('.result-screen')
+        : container.querySelector('.progress-count')?.textContent === `${index + 2} / 10`)
+    }
+    await until(() => button('再来一组').disabled)
+    const data = await exportProgress()
+    expect(data.reviews).toHaveLength(10)
+    expect(data.history).toHaveLength(1)
+    expect(data.history[0]?.sentenceCount).toBe(10)
+    expect(data.history[0]?.partial).toBe(false)
+    act(() => button('回到主页').click())
+    expect(container.textContent).toContain('今日已学新句 10 句')
+    expect(button('暂时没有待练句子').disabled).toBe(true)
+  })
+
+  it('updates and pages long-term history after another tab saves', async () => {
+    await mount()
+    await Promise.all(Array.from({ length: 7 }, (_, index) => addHistoryEntry([], {
+      id: `other-${index}`, lessonId: 'deck', completedAt: new Date(2026, 8, 13, 12, index).toISOString(),
+      sentenceCount: index, elapsedMs: 1000,
+    })))
+    act(() => window.dispatchEvent(new StorageEvent('storage', { key: PROGRESS_UPDATED_KEY, storageArea: window.localStorage })))
+    await until(() => container.querySelectorAll('.history-row').length === 5)
+    expect(container.textContent).toContain('共 7 轮')
+    act(() => button('下一页').click())
+    await until(() => container.querySelectorAll('.history-row').length === 2)
   })
 })

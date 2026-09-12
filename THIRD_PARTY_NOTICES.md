@@ -23,3 +23,7 @@
 - 未导入音频、图片、卡片模板或 Anki 复习进度。
 
 以上许可和署名适用于这份卡组数据，不代表项目内其他第三方软件依赖采用相同许可。各软件包保留其各自许可文件。
+
+## ts-fsrs
+
+记忆复习使用 [ts-fsrs](https://github.com/open-spaced-repetition/ts-fsrs) 5.4.2（FSRS 调度库）。Copyright (c) 2026 Open Spaced Repetition，MIT 许可。完整许可随网站发布，见 [public/licenses/ts-fsrs.txt](public/licenses/ts-fsrs.txt)。

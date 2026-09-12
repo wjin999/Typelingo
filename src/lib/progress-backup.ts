@@ -1,85 +1,86 @@
-import type { HistoryEntry } from '../types'
-import { HISTORY_KEY, PERMANENTLY_SKIPPED_KEY, loadHistory, loadPermanentlySkippedSentenceIds } from './storage'
+import { exportProgress, mergeProgress, validHistoryEntry, type ProgressData } from './storage'
+import { sentenceKey, type ReviewEntry, type SentenceProgress } from './scheduler'
+export type { ProgressData } from './storage'
 
-export const MAX_BACKUP_BYTES = 5 * 1024 * 1024
-export interface ProgressData {
-  history: HistoryEntry[]
-  permanentlySkippedSentenceIds: string[]
-}
-interface ProgressFile extends ProgressData {
-  format: 'typelingo-progress'
-  version: 1
-  exportedAt: string
+// This is an import memory safeguard, not a limit on stored learning history.
+export const MAX_BACKUP_BYTES = 256 * 1024 * 1024
+const validId = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 2000
+const validDate = (value: unknown): value is string => typeof value === 'string' && Number.isFinite(Date.parse(value))
+const nonnegative = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0
+const counter = (value: unknown) => nonnegative(value) && Number.isSafeInteger(value)
+
+function validCard(value: unknown): value is SentenceProgress {
+  if (!value || typeof value !== 'object') return false
+  const entry = value as SentenceProgress
+  const card = entry.card
+  return validId(entry.lessonId) && validId(entry.sentenceId)
+    && entry.id === sentenceKey(entry.lessonId, entry.sentenceId)
+    && (entry.sourceNoteId === undefined || validId(entry.sourceNoteId))
+    && validDate(entry.introducedAt) && validDate(entry.updatedAt)
+    && Date.parse(entry.introducedAt) <= Date.parse(entry.updatedAt)
+    && !!card && typeof card === 'object' && validDate(card.due) && validDate(card.last_review)
+    && card.last_review === entry.updatedAt && Date.parse(card.due) >= Date.parse(entry.updatedAt)
+    && nonnegative(card.stability) && card.stability > 0
+    && nonnegative(card.difficulty) && card.difficulty >= 1 && card.difficulty <= 10
+    && counter(card.elapsed_days) && counter(card.scheduled_days) && counter(card.learning_steps)
+    && counter(card.reps) && card.reps > 0 && counter(card.lapses) && card.lapses <= card.reps
+    && [1, 2, 3].includes(card.state)
 }
 
-function mergeHistory(entries: HistoryEntry[]): HistoryEntry[] {
-  const byId = new Map<string, HistoryEntry>()
-  for (const entry of entries) if (!byId.has(entry.id)) byId.set(entry.id, entry)
-  return [...byId.values()].sort((a, b) => Date.parse(b.completedAt) - Date.parse(a.completedAt)).slice(0, 20)
+function validReview(value: unknown): value is ReviewEntry {
+  if (!value || typeof value !== 'object') return false
+  const entry = value as ReviewEntry
+  return validId(entry.id) && validId(entry.lessonId) && validId(entry.sentenceId)
+    && validDate(entry.reviewedAt) && nonnegative(entry.elapsedMs) && typeof entry.hintUsed === 'boolean'
+    && ((entry.mode === 'free' && entry.rating === null)
+      || (entry.mode === 'memory' && entry.rating !== null && [1, 2, 3, 4].includes(entry.rating)))
 }
 
-function validId(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0 && value.length <= 1000
+function newest<T extends { id: string }>(entries: T[], date: (entry: T) => string): T[] {
+  const byId = new Map<string, T>()
+  for (const entry of entries) {
+    const old = byId.get(entry.id)
+    if (!old || Date.parse(date(entry)) >= Date.parse(date(old))) byId.set(entry.id, entry)
+  }
+  return [...byId.values()]
 }
 
 export function serializeProgress(progress: ProgressData): string {
-  const file: ProgressFile = {
-    format: 'typelingo-progress', version: 1, exportedAt: new Date().toISOString(),
-    history: mergeHistory(progress.history),
-    permanentlySkippedSentenceIds: [...new Set(progress.permanentlySkippedSentenceIds)],
-  }
-  return JSON.stringify(file, null, 2)
+  return JSON.stringify({ format: 'typelingo-progress', version: 2,
+    scheduler: 'ts-fsrs-5.4.2-default-r90', exportedAt: new Date().toISOString(), ...progress })
 }
 
 export function parseProgress(source: string): ProgressData {
-  if (new TextEncoder().encode(source).length > MAX_BACKUP_BYTES) throw new Error('进度文件超过 5 MB，无法恢复。')
-  let value: Partial<ProgressFile> | null
-  try { value = JSON.parse(source) as Partial<ProgressFile> | null } catch { throw new Error('文件不是有效的 JSON 进度备份。') }
-  if (!value || value.format !== 'typelingo-progress' || value.version !== 1) {
-    throw new Error('请选择 TypeLingo 导出的进度备份（版本 1）。')
+  if (source.length > MAX_BACKUP_BYTES || new TextEncoder().encode(source).length > MAX_BACKUP_BYTES) {
+    throw new Error('备份超过 256 MB 的单文件恢复上限。')
   }
-  if (!Array.isArray(value.history) || !Array.isArray(value.permanentlySkippedSentenceIds)
-    || value.history.length > 10000 || value.permanentlySkippedSentenceIds.length > 100000) {
-    throw new Error('进度文件结构或记录数量无效。')
+  let value
+  try { value = JSON.parse(source) } catch { throw new Error('文件不是有效的 JSON 进度备份。') }
+  if (!value || value.format !== 'typelingo-progress' || ![1, 2].includes(value.version)) {
+    throw new Error('请选择 TypeLingo 导出的进度备份（版本 1 或 2）。')
   }
-  const history = value.history.map((entry) => {
-    if (!entry || !validId(entry.id) || !validId(entry.lessonId)
-      || typeof entry.completedAt !== 'string' || !Number.isFinite(Date.parse(entry.completedAt))
-      || !Number.isSafeInteger(entry.sentenceCount) || entry.sentenceCount < 0
-      || typeof entry.elapsedMs !== 'number' || !Number.isFinite(entry.elapsedMs) || entry.elapsedMs < 0
-      || (entry.lessonTitle !== undefined && (typeof entry.lessonTitle !== 'string' || entry.lessonTitle.length > 1000))) {
-      throw new Error('进度文件包含无效的练习记录。')
-    }
-    return {
-      id: entry.id, lessonId: entry.lessonId, completedAt: entry.completedAt,
-      sentenceCount: entry.sentenceCount, elapsedMs: entry.elapsedMs,
-      ...(entry.lessonTitle !== undefined ? { lessonTitle: entry.lessonTitle } : {}),
-    }
-  })
-  if (!value.permanentlySkippedSentenceIds.every(validId)) throw new Error('进度文件包含无效的跳过记录。')
-  return { history: mergeHistory(history), permanentlySkippedSentenceIds: [...new Set(value.permanentlySkippedSentenceIds)] }
+  if (!Array.isArray(value.history) || !value.history.every(validHistoryEntry)
+    || !Array.isArray(value.permanentlySkippedSentenceIds) || !value.permanentlySkippedSentenceIds.every(validId)) {
+    throw new Error('进度文件包含无效的成绩或跳过记录。')
+  }
+  const cards = value.version === 1 ? [] : value.cards
+  const reviews = value.version === 1 ? [] : value.reviews
+  if (value.version === 2 && value.scheduler !== 'ts-fsrs-5.4.2-default-r90') {
+    throw new Error('此备份使用了不兼容的复习算法版本，请使用对应版本的 TypeLingo 恢复。')
+  }
+  if (!Array.isArray(cards) || !cards.every(validCard) || !Array.isArray(reviews) || !reviews.every(validReview)) {
+    throw new Error('进度文件包含无效的复习计划或逐句记录。')
+  }
+  return {
+    history: newest(value.history, (entry) => entry.completedAt),
+    permanentlySkippedSentenceIds: [...new Set<string>(value.permanentlySkippedSentenceIds)],
+    cards: newest<SentenceProgress>(cards, (entry) => entry.updatedAt),
+    reviews: newest<ReviewEntry>(reviews, (entry) => entry.reviewedAt),
+  }
 }
 
-export function restoreProgress(source: string): ProgressData {
+export async function restoreProgress(source: string): Promise<ProgressData> {
   const imported = parseProgress(source)
-  const storage = window.localStorage
-  const previousHistory = storage.getItem(HISTORY_KEY)
-  const previousSkipped = storage.getItem(PERMANENTLY_SKIPPED_KEY)
-  const merged = {
-    history: mergeHistory([...loadHistory(), ...imported.history]),
-    permanentlySkippedSentenceIds: [...new Set([...loadPermanentlySkippedSentenceIds(), ...imported.permanentlySkippedSentenceIds])],
-  }
-  try {
-    storage.setItem(HISTORY_KEY, JSON.stringify(merged.history))
-    storage.setItem(PERMANENTLY_SKIPPED_KEY, JSON.stringify(merged.permanentlySkippedSentenceIds))
-  } catch {
-    try {
-      if (previousHistory === null) storage.removeItem(HISTORY_KEY)
-      else storage.setItem(HISTORY_KEY, previousHistory)
-      if (previousSkipped === null) storage.removeItem(PERMANENTLY_SKIPPED_KEY)
-      else storage.setItem(PERMANENTLY_SKIPPED_KEY, previousSkipped)
-    } catch { /* Storage may have become unavailable; report failure to the user. */ }
-    throw new Error('恢复失败，浏览器存储不可用或空间不足。请保留备份文件后重试。')
-  }
-  return merged
+  await mergeProgress(imported)
+  return exportProgress()
 }

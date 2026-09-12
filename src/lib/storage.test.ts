@@ -1,133 +1,87 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import {
-  addHistoryEntry,
-  clearPermanentlySkippedSentences,
-  loadHistory,
-  loadPermanentlySkippedSentenceIds,
-  permanentlySkipSentence,
-} from './storage'
-import type { HistoryEntry } from '../types'
+import { IDBFactory, IDBObjectStore } from 'fake-indexeddb'
+import { addHistoryEntry, clearPermanentlySkippedSentences, exportProgress, historyCount,
+  loadHistory, loadPermanentlySkippedSentenceIds, permanentlySkipSentence, recordReview, HISTORY_KEY, PERMANENTLY_SKIPPED_KEY } from './storage'
+import type { HistoryEntry, LessonItem } from '../types'
+import type { ReviewEntry } from './scheduler'
 
 const values = new Map<string, string>()
-const historyEntry: HistoryEntry = {
-  id: 'session-1',
-  completedAt: '2026-09-05T00:00:00.000Z',
-  lessonId: 'ja-basic',
-  sentenceCount: 1,
-  elapsedMs: 1000,
-}
+const history: HistoryEntry = { id: 'session', completedAt: '2026-09-13T01:00:00.000Z',
+  lessonId: 'deck', sentenceCount: 1, elapsedMs: 1000 }
+const item: LessonItem = { id: 'sentence', text: '猫', nativeText: '猫', ruby: [{ text: '猫', reading: 'ねこ' }] }
+const review: ReviewEntry = { id: 'review', lessonId: 'deck', sentenceId: item.id,
+  reviewedAt: history.completedAt, mode: 'memory', rating: 3, hintUsed: false, elapsedMs: 1000 }
 
 beforeEach(() => {
   values.clear()
-  vi.stubGlobal('window', {
-    localStorage: {
-      getItem: (key: string) => values.get(key) ?? null,
-      setItem: (key: string, value: string) => values.set(key, value),
-      removeItem: (key: string) => values.delete(key),
-    },
-  })
+  vi.stubGlobal('indexedDB', new IDBFactory())
+  vi.stubGlobal('window', { localStorage: {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => values.set(key, value),
+  } })
 })
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
 
-afterEach(() => {
-  vi.unstubAllGlobals()
-})
-
-describe('practice history', () => {
-  it('keeps another tab\'s saved session when the caller has stale history', () => {
-    addHistoryEntry([], historyEntry)
-    const second = { ...historyEntry, id: 'session-2' }
-
-    expect(addHistoryEntry([], second)).toEqual([second, historyEntry])
-    expect(loadHistory()).toEqual([second, historyEntry])
+describe('durable learning records', () => {
+  it('migrates valid legacy data once and does not resurrect cleared skips', async () => {
+    values.set(HISTORY_KEY, JSON.stringify([history, { ...history, id: 'invalid', completedAt: 'invalid' }]))
+    values.set(PERMANENTLY_SKIPPED_KEY, JSON.stringify(['sentence']))
+    expect(await loadHistory()).toEqual([history])
+    expect(await loadPermanentlySkippedSentenceIds()).toEqual(['sentence'])
+    await clearPermanentlySkippedSentences()
+    expect(await loadPermanentlySkippedSentenceIds()).toEqual([])
+    expect(values.has(HISTORY_KEY)).toBe(true)
   })
 
-  it('deduplicates merged history and retains the latest 20 sessions', () => {
-    let current: HistoryEntry[] = []
-    for (let index = 0; index < 25; index += 1) {
-      current = addHistoryEntry(current, { ...historyEntry, id: `session-${index}` })
-    }
-
-    expect(loadHistory()).toHaveLength(20)
-    expect(loadHistory().map((entry) => entry.id)).toEqual(
-      Array.from({ length: 20 }, (_, index) => `session-${24 - index}`),
-    )
+  it('retains all records and pages them without losing parallel writes', async () => {
+    await Promise.all(Array.from({ length: 35 }, (_, index) => addHistoryEntry([], {
+      ...history, id: `session-${index}`, completedAt: new Date(Date.parse(history.completedAt) + index * 1000).toISOString(),
+    })))
+    expect(await historyCount()).toBe(35)
+    expect((await loadHistory(5, 30)).map((entry) => entry.id)).toEqual(['session-4', 'session-3', 'session-2', 'session-1', 'session-0'])
+    expect((await exportProgress()).history).toHaveLength(35)
   })
 
-  it('filters invalid dates while preserving valid records', () => {
-    values.set('typelingo.history.ja.v2', JSON.stringify([
-      { ...historyEntry, id: 'bad-date', completedAt: 'not-a-date' },
-      { ...historyEntry, id: 'empty-date', completedAt: '' },
-      historyEntry,
-    ]))
-
-    expect(loadHistory()).toEqual([historyEntry])
+  it('persists sentence rating, schedule and partial session atomically and deduplicates retries', async () => {
+    const card = await recordReview(review, item, { ...history, partial: true })
+    await recordReview(review, item, history)
+    const saved = await exportProgress()
+    expect(saved.cards).toEqual([card])
+    expect(saved.reviews).toEqual([review])
+    expect(saved.history[0]?.partial).toBe(true)
+    expect(saved.cards[0]?.card.reps).toBe(1)
   })
 
-  it('keeps in-memory sessions when storage writes fail', () => {
-    vi.spyOn(window.localStorage, 'setItem').mockImplementation(() => {
-      throw new Error('Storage full')
+  it('rejects a stale second tab without adding a review or replacing history', async () => {
+    await recordReview(review, item, history)
+    await expect(recordReview({ ...review, id: 'stale-review' }, item, { ...history, id: 'stale-session' })).rejects.toThrow('其他页面')
+    const data = await exportProgress()
+    expect(data.reviews).toHaveLength(1)
+    expect(data.history).toHaveLength(1)
+  })
+
+  it('rolls back the card and history when the review log cannot be saved', async () => {
+    await loadHistory()
+    const put = IDBObjectStore.prototype.put
+    vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (this: IDBObjectStore, value, key) {
+      if (this.name === 'reviews') throw new DOMException('Full', 'QuotaExceededError')
+      return put.call(this, value, key)
     })
-    const first = addHistoryEntry([], historyEntry)
-    const second = { ...historyEntry, id: 'session-2' }
-
-    expect(addHistoryEntry(first, second)).toEqual([second, historyEntry])
-  })
-})
-
-describe('permanently skipped sentences', () => {
-  it('stores sentence ids without duplicates and loads them again', () => {
-    const first = permanentlySkipSentence([], 'sentence-1')
-    const duplicate = permanentlySkipSentence(first, 'sentence-1')
-    permanentlySkipSentence(duplicate, 'sentence-2')
-
-    expect(first).toEqual(['sentence-1'])
-    expect(loadPermanentlySkippedSentenceIds()).toEqual([
-      'sentence-1',
-      'sentence-2',
-    ])
+    await expect(recordReview(review, item, history)).rejects.toThrow('未能保存')
+    expect(await exportProgress()).toEqual({ cards: [], reviews: [], history: [], permanentlySkippedSentenceIds: [] })
   })
 
-  it('clears every permanently skipped sentence', () => {
-    permanentlySkipSentence([], 'sentence-1')
-
-    expect(clearPermanentlySkippedSentences()).toEqual([])
-    expect(loadPermanentlySkippedSentenceIds()).toEqual([])
+  it('free typing saves an attempt without changing memory state', async () => {
+    await recordReview({ ...review, mode: 'free', rating: null }, item, history)
+    const data = await exportProgress()
+    expect(data.cards).toEqual([])
+    expect(data.reviews).toHaveLength(1)
   })
 
-  it('restores one deck without changing skips in another deck', () => {
-    permanentlySkipSentence([], 'deck-a:1')
-    permanentlySkipSentence([], 'deck-b:1')
-    expect(clearPermanentlySkippedSentences(['deck-a:1'])).toEqual(['deck-b:1'])
-    expect(loadPermanentlySkippedSentenceIds()).toEqual(['deck-b:1'])
-  })
-
-  it('merges a new skip with another tab\'s saved ids', () => {
-    permanentlySkipSentence([], 'sentence-1')
-
-    expect(permanentlySkipSentence([], 'sentence-2')).toEqual([
-      'sentence-1',
-      'sentence-2',
-    ])
-    expect(loadPermanentlySkippedSentenceIds()).toEqual(['sentence-1', 'sentence-2'])
-  })
-
-  it('does not resurrect ids restored in another tab', () => {
-    const stale = permanentlySkipSentence([], 'sentence-1')
-    clearPermanentlySkippedSentences()
-
-    expect(permanentlySkipSentence(stale, 'sentence-2')).toEqual(['sentence-2'])
-    expect(loadPermanentlySkippedSentenceIds()).toEqual(['sentence-2'])
-  })
-
-  it('keeps in-memory skips when storage writes fail', () => {
-    vi.spyOn(window.localStorage, 'setItem').mockImplementation(() => {
-      throw new Error('Storage full')
-    })
-    const first = permanentlySkipSentence([], 'sentence-1')
-
-    expect(permanentlySkipSentence(first, 'sentence-2')).toEqual([
-      'sentence-1',
-      'sentence-2',
-    ])
+  it('restores one deck without removing another deck or resurrecting stale skips', async () => {
+    await permanentlySkipSentence([], 'a:1')
+    await permanentlySkipSentence([], 'b:1')
+    expect(await clearPermanentlySkippedSentences(['a:1'])).toEqual(['b:1'])
+    expect(await permanentlySkipSentence(['a:1'], 'a:2')).toEqual(['a:2', 'b:1'])
   })
 })

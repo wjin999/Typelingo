@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { loadDefaultDeck } from './lib/default-deck'
 import { DeckPicker } from './components/DeckPicker'
 import { AnkiImport } from './components/AnkiImport'
@@ -8,12 +8,16 @@ import { formatDuration, sampleItems } from './lib/practice'
 import {
   addHistoryEntry,
   clearPermanentlySkippedSentences,
-  HISTORY_KEY,
+  historyCount,
+  loadCards,
   loadHistory,
   loadPermanentlySkippedSentenceIds,
-  PERMANENTLY_SKIPPED_KEY,
+  PROGRESS_UPDATED_KEY,
+  recordReview,
   permanentlySkipSentence,
 } from './lib/storage'
+import { GRADES, GRADE_LABELS, ratingIntervals, studyPlan, type PracticeMode, type SentenceProgress } from './lib/scheduler'
+import type { Grade } from 'ts-fsrs'
 import type {
   HistoryEntry,
   Lesson,
@@ -26,15 +30,8 @@ const SELECTED_DECK_KEY = 'typelingo.selected-deck.v1'
 
 type Screen = 'home' | 'practice' | 'result'
 
-function createHistoryEntry(summary: PracticeSummary, lesson: Lesson): HistoryEntry {
-  return {
-    id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-    completedAt: new Date().toISOString(),
-    lessonId: lesson.id,
-    lessonTitle: lesson.title,
-    sentenceCount: summary.sentenceCount,
-    elapsedMs: summary.elapsedMs,
-  }
+function preference(key: string, fallback: string): string {
+  try { return localStorage.getItem(key) ?? fallback } catch { return fallback }
 }
 
 function App() {
@@ -70,7 +67,8 @@ function PracticeApp({ defaultLesson }: { defaultLesson: Lesson }) {
       ? { ...deck, metadata: { ...deck.metadata!, builtIn: true } } : deck)
     return [...byId.values()]
   }, [importedDecks, defaultLesson])
-  const lesson = lessons.find((deck) => deck.id === selectedId) ?? defaultLesson
+  const [sessionLesson, setSessionLesson] = useState<Lesson | null>(null)
+  const lesson = sessionLesson ?? lessons.find((deck) => deck.id === selectedId) ?? defaultLesson
   const [screen, setScreen] = useState<Screen>('home')
   const [queue, setQueue] = useState<LessonItem[]>([])
   const [currentIndex, setCurrentIndex] = useState(0)
@@ -78,21 +76,73 @@ function PracticeApp({ defaultLesson }: { defaultLesson: Lesson }) {
   const [startedAt, setStartedAt] = useState<number | null>(null)
   const [completedSentenceCount, setCompletedSentenceCount] = useState(0)
   const [summary, setSummary] = useState<PracticeSummary | null>(null)
-  const [history, setHistory] = useState<HistoryEntry[]>(loadHistory)
-  const [permanentlySkippedIds, setPermanentlySkippedIds] = useState<string[]>(
-    loadPermanentlySkippedSentenceIds,
-  )
+  const [history, setHistory] = useState<HistoryEntry[]>([])
+  const [historyTotal, setHistoryTotal] = useState(0)
+  const [historyPage, setHistoryPage] = useState(0)
+  const [permanentlySkippedIds, setPermanentlySkippedIds] = useState<string[]>([])
+  const [cards, setCards] = useState<SentenceProgress[]>([])
+  const [progressReady, setProgressReady] = useState(false)
+  const [progressError, setProgressError] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [mode, setMode] = useState<PracticeMode>(() => preference('typelingo.mode', 'memory') === 'free' ? 'free' : 'memory')
+  const [dailyNewLimit, setDailyNewLimit] = useState(() => {
+    const value = Number(preference('typelingo.daily-new', '10'))
+    return Number.isInteger(value) && value >= 0 && value <= 100 ? value : 10
+  })
+  const [clockNow, setClockNow] = useState(Date.now())
+  const [completedAt, setCompletedAt] = useState<number | null>(null)
   const [showFurigana, setShowFurigana] = useState(true)
   const inputRef = useRef<HTMLInputElement>(null)
   const isComposingRef = useRef(false)
+  const savingRef = useRef(false)
+  const roundIdRef = useRef('')
+  const sentenceStartedRef = useRef(0)
+  const hintUsedRef = useRef(false)
+  const sessionCardsRef = useRef<SentenceProgress[]>([])
+  const refreshVersionRef = useRef(0)
 
   const currentItem = queue[currentIndex]
-  const isSentenceComplete = currentItem?.text === typed
+  const isSentenceComplete = completedAt !== null
   const skippedIds = useMemo(() => new Set(permanentlySkippedIds), [permanentlySkippedIds])
   const availableItems = useMemo(() => lesson.items.filter(
     (item) => !skippedIds.has(item.id) && (level === 'all' || item.level === level),
   ), [lesson, skippedIds, level])
   const skippedCount = useMemo(() => lesson.items.filter((item) => skippedIds.has(item.id)).length, [lesson, skippedIds])
+  const plan = useMemo(() => studyPlan(availableItems, lesson.id, cards, dailyNewLimit, new Date(clockNow)),
+    [availableItems, lesson.id, cards, dailyNewLimit, clockNow])
+  const canStart = progressReady && !saving && (mode === 'free' ? availableItems.length > 0 : plan.queue.length > 0)
+  const currentProgress = currentItem ? sessionCardsRef.current.find((entry) => entry.lessonId === lesson.id && entry.sentenceId === currentItem.id) : undefined
+  const intervals = completedAt !== null && mode === 'memory' ? ratingIntervals(currentProgress, new Date(completedAt)) : []
+
+  const refreshProgress = useCallback(async () => {
+    const version = ++refreshVersionRef.current
+    try {
+      const [recent, total, skipped, progress] = await Promise.all([
+        loadHistory(5, historyPage * 5), historyCount(), loadPermanentlySkippedSentenceIds(), loadCards(),
+      ])
+      if (version !== refreshVersionRef.current) return
+      setHistory(recent); setHistoryTotal(total); setPermanentlySkippedIds(skipped); setCards(progress)
+      setProgressReady(true); setProgressError(''); setClockNow(Date.now())
+    } catch (error) {
+      if (version === refreshVersionRef.current) setProgressError(error instanceof Error ? error.message : '读取学习记录失败。')
+    }
+  }, [historyPage])
+
+  useEffect(() => {
+    void refreshProgress()
+    function changed(event: StorageEvent) {
+      if (event.key === PROGRESS_UPDATED_KEY || event.key === null) void refreshProgress()
+    }
+    function focus() { void refreshProgress() }
+    window.addEventListener('storage', changed)
+    window.addEventListener('focus', focus)
+    const timer = window.setInterval(() => setClockNow(Date.now()), 15000)
+    return () => { window.removeEventListener('storage', changed); window.removeEventListener('focus', focus); window.clearInterval(timer) }
+  }, [refreshProgress])
+
+  useEffect(() => {
+    try { localStorage.setItem('typelingo.mode', mode); localStorage.setItem('typelingo.daily-new', String(dailyNewLimit)) } catch { /* Preferences work for this visit. */ }
+  }, [mode, dailyNewLimit])
 
   useEffect(() => {
     let active = true
@@ -128,46 +178,46 @@ function PracticeApp({ defaultLesson }: { defaultLesson: Lesson }) {
     }
   }, [currentIndex, screen])
 
-  useEffect(() => {
-    function syncStorage(event: StorageEvent) {
-      if (event.storageArea !== window.localStorage) return
+  async function startPractice() {
+    if (!progressReady || savingRef.current) return
+    savingRef.current = true; setSaving(true); setProgressError('')
+    try {
+      const [latestCards, latestSkipped] = await Promise.all([loadCards(), loadPermanentlySkippedSentenceIds()])
+      setCards(latestCards); setPermanentlySkippedIds(latestSkipped); setClockNow(Date.now())
+      const skipped = new Set(latestSkipped)
+      const available = lesson.items.filter((item) => !skipped.has(item.id) && (level === 'all' || item.level === level))
+      const items = mode === 'free' ? sampleItems(available, SESSION_SIZE)
+        : studyPlan(available, lesson.id, latestCards, dailyNewLimit).queue
+      if (items.length === 0) return
 
-      if (event.key === null || event.key === HISTORY_KEY) {
-        setHistory(loadHistory())
-      }
-      if (event.key === null || event.key === PERMANENTLY_SKIPPED_KEY) {
-        setPermanentlySkippedIds(loadPermanentlySkippedSentenceIds())
-      }
-    }
-
-    window.addEventListener('storage', syncStorage)
-    return () => window.removeEventListener('storage', syncStorage)
-  }, [])
-
-  function startPractice() {
-    const items = sampleItems(availableItems, SESSION_SIZE)
-
-    if (items.length === 0) {
-      return
-    }
-
-    setQueue(items)
-    setCurrentIndex(0)
-    setTyped('')
-    setStartedAt(Date.now())
-    setCompletedSentenceCount(0)
-    setSummary(null)
-    setShowFurigana(true)
-    isComposingRef.current = false
-    setScreen('practice')
+      setQueue(items)
+      setSessionLesson(lesson)
+      sessionCardsRef.current = latestCards
+      roundIdRef.current = crypto.randomUUID()
+      setCurrentIndex(0)
+      setTyped('')
+      setCompletedAt(null)
+      setStartedAt(Date.now())
+      setCompletedSentenceCount(0)
+      setSummary(null)
+      setShowFurigana(mode === 'free')
+      hintUsedRef.current = mode === 'free'
+      sentenceStartedRef.current = Date.now()
+      isComposingRef.current = false
+      setScreen('practice')
+    } catch (error) { setProgressError(error instanceof Error ? error.message : '无法开始练习。') }
+    finally { savingRef.current = false; setSaving(false) }
   }
 
   function handleInputChange(nextValue: string) {
-    if (!currentItem) {
+    if (!currentItem || isSentenceComplete) {
       return
     }
 
     setTyped(nextValue)
+    if (!isComposingRef.current && nextValue === currentItem.text) {
+      setCompletedAt(Date.now()); if (mode === 'memory') setShowFurigana(true)
+    }
   }
 
   function handleCompositionStart() {
@@ -181,6 +231,9 @@ function PracticeApp({ defaultLesson }: { defaultLesson: Lesson }) {
 
     isComposingRef.current = false
     setTyped(nextValue)
+    if (nextValue === currentItem.text) {
+      setCompletedAt(Date.now()); if (mode === 'memory') setShowFurigana(true)
+    }
   }
 
   function completePractice(sentenceCount: number) {
@@ -191,8 +244,8 @@ function PracticeApp({ defaultLesson }: { defaultLesson: Lesson }) {
     }
 
     setSummary(nextSummary)
-    setHistory(addHistoryEntry(history, createHistoryEntry(nextSummary, lesson)))
     setScreen('result')
+    void refreshProgress()
   }
 
   function advanceFromCurrent(sentenceCount: number) {
@@ -203,36 +256,64 @@ function PracticeApp({ defaultLesson }: { defaultLesson: Lesson }) {
 
     setCurrentIndex((current) => current + 1)
     setTyped('')
+    setCompletedAt(null)
+    setShowFurigana(mode === 'free')
+    hintUsedRef.current = mode === 'free'
+    sentenceStartedRef.current = Date.now()
     isComposingRef.current = false
   }
 
-  function goToNextSentence() {
-    if (!isSentenceComplete) {
-      return
-    }
-
-    const nextCompletedCount = completedSentenceCount + 1
-    setCompletedSentenceCount(nextCompletedCount)
-    advanceFromCurrent(nextCompletedCount)
+  function roundHistory(sentenceCount: number): HistoryEntry {
+    return { id: roundIdRef.current, completedAt: new Date().toISOString(),
+      lessonId: lesson.id, lessonTitle: lesson.title, sentenceCount,
+      elapsedMs: Math.max(1, Date.now() - (startedAt ?? Date.now())), mode,
+      partial: currentIndex + 1 < queue.length }
   }
 
-  function skipCurrentSentence(permanent: boolean) {
-    if (!currentItem) {
-      return
-    }
-
-    if (permanent) {
-      setPermanentlySkippedIds(
-        permanentlySkipSentence(permanentlySkippedIds, currentItem.id),
-      )
-    }
-
-    advanceFromCurrent(completedSentenceCount)
+  async function submitSentence(grade: Grade | null) {
+    if (!currentItem || completedAt === null || isComposingRef.current || savingRef.current) return
+    savingRef.current = true; setSaving(true); setProgressError('')
+    try {
+      const nextCount = completedSentenceCount + 1
+      await recordReview({ id: `${roundIdRef.current}:${currentIndex}`, lessonId: lesson.id,
+        sentenceId: currentItem.id, reviewedAt: new Date(completedAt).toISOString(), mode, rating: grade,
+        hintUsed: hintUsedRef.current, elapsedMs: Math.max(0, completedAt - sentenceStartedRef.current) },
+        currentItem, roundHistory(nextCount), currentProgress?.updatedAt)
+      setCompletedSentenceCount(nextCount)
+      advanceFromCurrent(nextCount)
+    } catch (error) { setProgressError(error instanceof Error ? error.message : '保存失败，请重试。') }
+    finally { savingRef.current = false; setSaving(false); inputRef.current?.focus() }
   }
 
-  function restorePermanentlySkippedSentences() {
-    setPermanentlySkippedIds(clearPermanentlySkippedSentences(lesson.items.map((item) => item.id)))
+  async function skipCurrentSentence(permanent: boolean) {
+    if (!currentItem || savingRef.current || isSentenceComplete) return
+    savingRef.current = true; setSaving(true); setProgressError('')
+    try {
+      if (permanent) setPermanentlySkippedIds(await permanentlySkipSentence(permanentlySkippedIds, currentItem.id))
+      if (currentIndex + 1 >= queue.length) await addHistoryEntry([], roundHistory(completedSentenceCount))
+      advanceFromCurrent(completedSentenceCount)
+    } catch (error) { setProgressError(error instanceof Error ? error.message : '保存失败，请重试。') }
+    finally { savingRef.current = false; setSaving(false) }
   }
+
+  async function restorePermanentlySkippedSentences() {
+    try { setPermanentlySkippedIds(await clearPermanentlySkippedSentences(lesson.items.map((item) => item.id))) }
+    catch (error) { setProgressError(error instanceof Error ? error.message : '恢复失败。') }
+  }
+
+  useEffect(() => {
+    function onRatingKey(event: KeyboardEvent) {
+      if (screen !== 'practice' || !isSentenceComplete || mode !== 'memory' || event.repeat
+        || event.isComposing || event.keyCode === 229 || isComposingRef.current
+        || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return
+      if (['1', '2', '3', '4'].includes(event.key)) {
+        event.preventDefault()
+        void submitSentence(Number(event.key) as Grade)
+      }
+    }
+    window.addEventListener('keydown', onRatingKey)
+    return () => window.removeEventListener('keydown', onRatingKey)
+  })
 
   function handleInputKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
     const isImeAction =
@@ -243,14 +324,14 @@ function PracticeApp({ defaultLesson }: { defaultLesson: Lesson }) {
 
     if (event.key === 'Enter' && !isImeAction) {
       event.preventDefault()
-      goToNextSentence()
+      if (mode === 'free' && !event.repeat) void submitSentence(null)
     }
   }
 
   return (
     <div className="app-shell">
       <header className="site-header">
-        <button className="brand" type="button" onClick={() => setScreen('home')}>
+        <button className="brand" type="button" disabled={saving} onClick={() => { setSessionLesson(null); setScreen('home'); void refreshProgress() }}>
           <span className="brand-mark" aria-hidden="true">
             T
           </span>
@@ -259,18 +340,33 @@ function PracticeApp({ defaultLesson }: { defaultLesson: Lesson }) {
       </header>
 
       <main className="main-content">
+        {progressError && <p role="alert" className="error-message">{progressError} {screen === 'home' && <button type="button" className="text-button" onClick={() => void refreshProgress()}>重试读取</button>}</p>}
         {screen === 'home' && libraryError && <p role="alert" className="error-message">{libraryError} 默认卡组仍可练习。</p>}
         {screen === 'home' && (
           <HomeScreen
             history={history}
-            availableSentenceCount={availableItems.length}
+            historyTotal={historyTotal}
+            historyPage={historyPage}
+            onHistoryPage={setHistoryPage}
+            canStart={canStart}
+            loading={!progressReady || saving}
             permanentlySkippedCount={skippedCount}
             onStart={startPractice}
             onRestoreSkipped={restorePermanentlySkippedSentences}
-            progressBackup={<ProgressBackup history={history} skippedIds={permanentlySkippedIds} onRestore={(progress) => {
-              setHistory(progress.history)
-              setPermanentlySkippedIds(progress.permanentlySkippedSentenceIds)
-            }} />}
+            progressBackup={<ProgressBackup onRestore={() => { setHistoryPage(0); void refreshProgress() }} />}
+            practiceOptions={<div className="practice-options">
+              <div className="mode-switch" role="group" aria-label="练习方式">
+                <button type="button" disabled={saving} aria-pressed={mode === 'memory'} onClick={() => setMode('memory')}>记忆复习</button>
+                <button type="button" disabled={saving} aria-pressed={mode === 'free'} onClick={() => setMode('free')}>自由跟打</button>
+              </div>
+              {mode === 'memory' ? <>
+                <p>先回忆读音，再跟打核对。完成后按 1–4 评分，安排下次复习。</p>
+                <label className="daily-new-label">每天新句上限（当前卡组）<input aria-label="每天新句上限" type="number" min="0" max="100" value={dailyNewLimit}
+                  onChange={(event) => { const value = Number(event.target.value); if (Number.isInteger(value) && value >= 0 && value <= 100) setDailyNewLimit(value) }} /></label>
+                <p aria-live="polite">到期 {plan.dueCount} 句 · 本轮新句 {plan.newCount} 句 · 今日已学新句 {plan.introducedToday} 句</p>
+                {progressReady && !plan.queue.length && <p>当前范围暂时没有待复习内容。{plan.nextDue ? `下次到期：${new Date(plan.nextDue).toLocaleString('zh-CN')}` : '可以调整等级、新句上限，或自由跟打。'}</p>}
+              </> : <p>随机选句，默认显示注音；完成后按 Enter 继续，不改变记忆复习计划。</p>}
+            </div>}
             deckPicker={<DeckPicker lessons={lessons} lesson={lesson} onSelect={selectDeck} onImport={() => setImportOpen(true)} level={level} onLevel={setLevel} />}
           />
         )}
@@ -303,7 +399,7 @@ function PracticeApp({ defaultLesson }: { defaultLesson: Lesson }) {
                     className="furigana-toggle"
                     type="button"
                     aria-pressed={showFurigana}
-                    onClick={() => setShowFurigana((current) => !current)}
+                    onClick={() => { if (!showFurigana && !isSentenceComplete) hintUsedRef.current = true; setShowFurigana((current) => !current); inputRef.current?.focus() }}
                   >
                     汉字注音：{showFurigana ? '开' : '关'}
                   </button>
@@ -312,7 +408,7 @@ function PracticeApp({ defaultLesson }: { defaultLesson: Lesson }) {
                   <JapaneseSentence
                     item={currentItem}
                     typed={typed}
-                    showFurigana={showFurigana}
+                    showFurigana={showFurigana || (mode === 'memory' && isSentenceComplete)}
                   />
                 </p>
               </div>
@@ -325,6 +421,8 @@ function PracticeApp({ defaultLesson }: { defaultLesson: Lesson }) {
                   type="text"
                   lang="ja"
                   value={typed}
+                  readOnly={isSentenceComplete}
+                  disabled={saving && !isSentenceComplete}
                   autoComplete="off"
                   autoCapitalize="off"
                   autoCorrect="off"
@@ -342,17 +440,27 @@ function PracticeApp({ defaultLesson }: { defaultLesson: Lesson }) {
                   <span>
                     请使用日语输入法；汉字、假名和标点必须一致，Backspace 可修正。
                   </span>
-                  <strong className={isSentenceComplete ? 'ready-message is-visible' : 'ready-message'}>
-                    输入完成，按 Enter 继续
-                  </strong>
+                  {isSentenceComplete && <strong className="ready-message is-visible">
+                    {mode === 'memory' ? '输入已锁定，按 1–4 评价记忆' : '输入完成，按 Enter 继续'}
+                  </strong>}
                 </div>
+                {mode === 'memory' && isSentenceComplete && <div className="rating-panel" aria-label="评价这句的记忆">
+                  <p role="status">{saving ? '正在保存…' : '按看注音前的回忆评分：想不起来选「重来」，费力但想起来选「困难」。'}</p>
+                  <div className="rating-options">
+                    {GRADES.map((grade, index) => <button key={grade} className={`rating-button rating-${grade}`} type="button"
+                      disabled={saving} onClick={() => void submitSentence(grade)} aria-keyshortcuts={String(grade)}>
+                      <strong>{GRADE_LABELS[index]}</strong><span>{intervals[index]}后</span><kbd>{grade}</kbd>
+                    </button>)}
+                  </div>
+                </div>}
               </div>
             </div>
 
-            <div className="skip-actions" aria-label="跳过当前句子">
+            {!isSentenceComplete && <div className="skip-actions" aria-label="跳过当前句子">
               <button
                 className="skip-button"
                 type="button"
+                disabled={saving}
                 onClick={() => skipCurrentSentence(false)}
               >
                 本次跳过该句
@@ -360,20 +468,21 @@ function PracticeApp({ defaultLesson }: { defaultLesson: Lesson }) {
               <button
                 className="skip-button skip-button--permanent"
                 type="button"
+                disabled={saving}
                 onClick={() => skipCurrentSentence(true)}
               >
                 永远跳过该句
               </button>
-            </div>
+            </div>}
           </section>
         )}
 
         {screen === 'result' && summary && (
           <ResultScreen
             summary={summary}
-            canRestart={availableItems.length > 0}
+            canRestart={canStart}
             onRestart={startPractice}
-            onHome={() => setScreen('home')}
+            onHome={() => { setSessionLesson(null); setScreen('home') }}
           />
         )}
       </main>
@@ -381,7 +490,7 @@ function PracticeApp({ defaultLesson }: { defaultLesson: Lesson }) {
       {importOpen && <AnkiImport onClose={() => setImportOpen(false)} onSave={importDeck} />}
 
       <footer className="site-footer">
-        卡组、记录和永久跳过的句子仅保存在当前浏览器中 · TypeLingo v0.3
+        卡组与学习记录长期保存在当前浏览器中，请定期备份 · TypeLingo v0.4
       </footer>
     </div>
   )
@@ -435,22 +544,32 @@ function JapaneseSentence({ item, typed, showFurigana }: JapaneseSentenceProps) 
 
 interface HomeScreenProps {
   history: HistoryEntry[]
-  availableSentenceCount: number
+  historyTotal: number
+  historyPage: number
+  onHistoryPage: (page: number) => void
+  canStart: boolean
+  loading: boolean
   permanentlySkippedCount: number
   onStart: () => void
   onRestoreSkipped: () => void
   deckPicker: React.ReactNode
   progressBackup: React.ReactNode
+  practiceOptions: React.ReactNode
 }
 
 function HomeScreen({
   history,
-  availableSentenceCount,
+  historyTotal,
+  historyPage,
+  onHistoryPage,
+  canStart,
+  loading,
   permanentlySkippedCount,
   onStart,
   onRestoreSkipped,
   deckPicker,
   progressBackup,
+  practiceOptions,
 }: HomeScreenProps) {
   return (
     <>
@@ -463,13 +582,14 @@ function HomeScreen({
             以假名输入联结汉字、读音与语义，沿助词与句型梳理表达结构。<br />
             让每次敲击，都成为有语境的日语练习。
           </p>
+          {practiceOptions}
           <button
             className="primary-button"
             type="button"
             onClick={onStart}
-            disabled={availableSentenceCount === 0}
+            disabled={!canStart}
           >
-            {availableSentenceCount === 0 ? '没有可练习句子' : '开始练习'}
+            {loading ? '正在读取进度…' : canStart ? '开始练习' : '暂时没有待练句子'}
             <span aria-hidden="true">→</span>
           </button>
           {permanentlySkippedCount > 0 && (
@@ -492,7 +612,7 @@ function HomeScreen({
             <span className="eyebrow">练习记录</span>
             <h2 id="history-title">最近成绩</h2>
           </div>
-          <span className="storage-note">最多保存 20 条</span>
+          <span className="storage-note">共 {historyTotal} 轮 · 长期保存</span>
         </div>
 
         {progressBackup}
@@ -504,7 +624,7 @@ function HomeScreen({
           </div>
         ) : (
           <div className="history-list">
-            {history.slice(0, 5).map((entry) => (
+            {history.map((entry) => (
               <article className="history-row" key={entry.id}>
                 <time dateTime={entry.completedAt}>
                   {new Intl.DateTimeFormat('zh-CN', {
@@ -515,12 +635,17 @@ function HomeScreen({
                   }).format(new Date(entry.completedAt))}
                   {entry.lessonTitle && <small className="history-deck">{entry.lessonTitle}</small>}
                 </time>
-                <strong>完成 {entry.sentenceCount} 句</strong>
+                <strong>完成 {entry.sentenceCount} 句{entry.partial && <small className="history-deck">未结束的一轮 · 已保存</small>}</strong>
                 <span>{formatDuration(entry.elapsedMs)}</span>
               </article>
             ))}
           </div>
         )}
+        {historyTotal > 5 && <nav className="history-pagination" aria-label="成绩分页">
+          <button type="button" className="text-button" disabled={historyPage === 0} onClick={() => onHistoryPage(historyPage - 1)}>上一页</button>
+          <span>{historyPage + 1} / {Math.ceil(historyTotal / 5)}</span>
+          <button type="button" className="text-button" disabled={(historyPage + 1) * 5 >= historyTotal} onClick={() => onHistoryPage(historyPage + 1)}>下一页</button>
+        </nav>}
       </section>
     </>
   )
@@ -543,7 +668,7 @@ function ResultScreen({ summary, canRestart, onRestart, onHome }: ResultScreenPr
       <h1 id="result-title">练习完成</h1>
       <p className="result-subtitle">
         {!canRestart
-          ? '没有可练习句子，请返回主页恢复已跳过的句子。'
+          ? '当前范围暂时没有待练句子，可回到主页查看复习安排或自由跟打。'
           : summary.sentenceCount > 0
             ? `完成 ${summary.sentenceCount} 个句子，继续保持这份节奏。`
             : '本轮已结束，你可以返回主页或再来一组。'}

@@ -49,6 +49,8 @@ export interface HistoryEntry {
   lessonTitle?: string
   sentenceCount: number
   elapsedMs: number
+  mode?: 'memory' | 'free'
+  partial?: boolean
 }
 
 export interface PracticeSummary {
