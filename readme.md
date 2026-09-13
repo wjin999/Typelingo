@@ -2,7 +2,7 @@
 
 通过跟打日语例句，联结汉字、读音与语义，熟悉助词和句型。
 
-**[在线使用](https://wjin999.github.io/Typelingo/)** · 无需注册，建议先开启日语输入法。
+**[在线使用](https://wjin999.github.io/Typelingo/)**
 
 ## 使用
 
